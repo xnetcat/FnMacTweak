@@ -784,47 +784,20 @@ static bool hooked_availability_version_check(uint32_t count,
 }
 
 // --------- CATALYST DOWNLOAD FIX ---------
-// On macOS Catalyst, Fortnite's NSURLSession background downloads break:
-//
-// 1) didFinishDownloadingToURL receives paths prefixed with /.nofollow/
-//    which don't exist — the Catalyst sandbox translates them but Fortnite's
-//    UE4 code accesses them raw. We strip the prefix so file ops succeed.
-//
-// 2) bDiscretionary=YES lets macOS defer downloads indefinitely. Combined
-//    with ForegroundStaleDownloadTimeout=30s, downloads get deprioritized
-//    then killed as "stale". We force discretionary=NO.
-
-%hook NSURLSessionConfiguration
-
-- (void)setDiscretionary:(BOOL)disc {
-    // Never mark Fortnite downloads as discretionary on macOS —
-    // this prevents the OS from deferring them.
-    %orig(NO);
-}
-
-%end
-
-// Hook the download delegate to fix /.nofollow/ paths
-%hook NSURLSessionDownloadTask
-%end
-
-// We need to intercept the file URL delivered by the system.
-// Hook the concrete download delegate callback on Fortnite's download manager.
-// The class is FIOSBackgroundDownloadCoreDelegates on UE.
-// Since we don't know the exact class name, we hook NSObject and filter.
+// On macOS Catalyst, nsurlsessiond delivers completed background downloads
+// to paths prefixed with /.nofollow/ which is a Catalyst sandbox artifact.
+// Fortnite's UE4 code accesses these paths raw and gets "file not found".
+// Hook NSFileManager to transparently strip the prefix so file ops succeed.
 
 static NSURL *fixNoFollowURL(NSURL *url) {
     if (!url) return url;
     NSString *path = [url path];
     if ([path hasPrefix:@"/.nofollow/"]) {
-        NSString *fixed = [path substringFromIndex:11]; // strip "/.nofollow/"
-        // /.nofollow/ prefix is followed by the real absolute path
-        return [NSURL fileURLWithPath:fixed];
+        return [NSURL fileURLWithPath:[path substringFromIndex:11]];
     }
     return url;
 }
 
-// Hook NSFileManager to transparently fix /.nofollow/ paths
 %hook NSFileManager
 
 - (NSDictionary *)attributesOfItemAtPath:(NSString *)path error:(NSError **)error {

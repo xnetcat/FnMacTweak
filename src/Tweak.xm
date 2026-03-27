@@ -754,6 +754,107 @@ static void dispatchControllerButton(NSInteger idx, BOOL pressed) {
 // ── Mapping Helpers ──────────────────────────────────────────────────────────
 // (Obsolete functions removed — logic moved to caller loops for multi-bind support)
 
+// --------- macOS 26.4 CRASH FIX ---------
+// Fortnite v40.00.1 has a Swift @available(iOS 17.4, *) check that, on
+// macOS 26.4 via Catalyst, takes a code path with a NULL async continuation
+// causing an immediate SIGSEGV on launch.  Hook _availability_version_check
+// (via fishhook / GOT patching — data pages only, no code-signing issues)
+// so the check returns false for iOS 17.4, forcing the safe fallback path.
+
+typedef struct {
+    uint32_t platform;
+    uint32_t version;       /* major<<16 | minor<<8 | patch */
+} dyld_build_version_t;
+
+#define PLATFORM_IOS       2
+#define PACK_VER(M,m,p)    (((uint32_t)(M)<<16)|((uint32_t)(m)<<8)|(uint32_t)(p))
+#define BLOCKED_VERSION    PACK_VER(17, 4, 0)
+
+static bool (*orig_availability_version_check)(uint32_t, dyld_build_version_t []);
+
+static bool hooked_availability_version_check(uint32_t count,
+                                               dyld_build_version_t versions[]) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (versions[i].platform == PLATFORM_IOS &&
+            versions[i].version  == BLOCKED_VERSION) {
+            return false;
+        }
+    }
+    return orig_availability_version_check(count, versions);
+}
+
+// --------- CATALYST DOWNLOAD FIX ---------
+// On macOS Catalyst, Fortnite's NSURLSession background downloads break:
+//
+// 1) didFinishDownloadingToURL receives paths prefixed with /.nofollow/
+//    which don't exist — the Catalyst sandbox translates them but Fortnite's
+//    UE4 code accesses them raw. We strip the prefix so file ops succeed.
+//
+// 2) bDiscretionary=YES lets macOS defer downloads indefinitely. Combined
+//    with ForegroundStaleDownloadTimeout=30s, downloads get deprioritized
+//    then killed as "stale". We force discretionary=NO.
+
+%hook NSURLSessionConfiguration
+
+- (void)setDiscretionary:(BOOL)disc {
+    // Never mark Fortnite downloads as discretionary on macOS —
+    // this prevents the OS from deferring them.
+    %orig(NO);
+}
+
+%end
+
+// Hook the download delegate to fix /.nofollow/ paths
+%hook NSURLSessionDownloadTask
+%end
+
+// We need to intercept the file URL delivered by the system.
+// Hook the concrete download delegate callback on Fortnite's download manager.
+// The class is FIOSBackgroundDownloadCoreDelegates on UE.
+// Since we don't know the exact class name, we hook NSObject and filter.
+
+static NSURL *fixNoFollowURL(NSURL *url) {
+    if (!url) return url;
+    NSString *path = [url path];
+    if ([path hasPrefix:@"/.nofollow/"]) {
+        NSString *fixed = [path substringFromIndex:11]; // strip "/.nofollow/"
+        // /.nofollow/ prefix is followed by the real absolute path
+        return [NSURL fileURLWithPath:fixed];
+    }
+    return url;
+}
+
+// Hook NSFileManager to transparently fix /.nofollow/ paths
+%hook NSFileManager
+
+- (NSDictionary *)attributesOfItemAtPath:(NSString *)path error:(NSError **)error {
+    if ([path hasPrefix:@"/.nofollow/"]) {
+        path = [path substringFromIndex:11];
+    }
+    return %orig(path, error);
+}
+
+- (BOOL)moveItemAtURL:(NSURL *)srcURL toURL:(NSURL *)dstURL error:(NSError **)error {
+    return %orig(fixNoFollowURL(srcURL), dstURL, error);
+}
+
+- (BOOL)moveItemAtPath:(NSString *)srcPath toPath:(NSString *)dstPath error:(NSError **)error {
+    if ([srcPath hasPrefix:@"/.nofollow/"]) {
+        srcPath = [srcPath substringFromIndex:11];
+    }
+    return %orig(srcPath, dstPath, error);
+}
+
+- (BOOL)fileExistsAtPath:(NSString *)path {
+    BOOL result = %orig;
+    if (!result && [path hasPrefix:@"/.nofollow/"]) {
+        return %orig([path substringFromIndex:11]);
+    }
+    return result;
+}
+
+%end
+
 // --------- DEVICE SPOOFING ---------
 // Intercepts sysctl/sysctlbyname to report DEVICE_MODEL and OEM_ID,
 // making Fortnite treat this Mac as a supported iOS device.
@@ -854,12 +955,13 @@ static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
     // Initialize Gyro-Mouse Proxy hooks
     ue_init_gyro_hooks();
 
-    // Fishhook for device spoofing
+    // Fishhook for device spoofing + macOS crash fix
     struct rebinding rebindings[] = {
         {"sysctl", (void *)pt_sysctl, (void **)&orig_sysctl},
-        {"sysctlbyname", (void *)pt_sysctlbyname, (void **)&orig_sysctlbyname}
+        {"sysctlbyname", (void *)pt_sysctlbyname, (void **)&orig_sysctlbyname},
+        {"_availability_version_check", (void *)hooked_availability_version_check, (void **)&orig_availability_version_check}
     };
-    rebind_symbols(rebindings, 2);
+    rebind_symbols(rebindings, 3);
 
     NSString* currentVersion = @"4.0.0";
     NSString* lastVersion = [[NSUserDefaults standardUserDefaults] stringForKey:@"fnmactweak.lastSeenVersion"];

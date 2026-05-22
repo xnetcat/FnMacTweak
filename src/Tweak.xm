@@ -754,34 +754,90 @@ static void dispatchControllerButton(NSInteger idx, BOOL pressed) {
 // ── Mapping Helpers ──────────────────────────────────────────────────────────
 // (Obsolete functions removed — logic moved to caller loops for multi-bind support)
 
-// --------- macOS 26.4 CRASH FIX ---------
-// Fortnite v40.00.1 has a Swift @available(iOS 17.4, *) check that, on
-// macOS 26.4 via Catalyst, takes a code path with a NULL async continuation
-// causing an immediate SIGSEGV on launch.  Hook _availability_version_check
-// (via fishhook / GOT patching — data pages only, no code-signing issues)
-// so the check returns false for iOS 17.4, forcing the safe fallback path.
+// --------- macOS CRASH FIX ---------
+// FnMacTweak hooks libSystem's _availability_version_check (via fishhook /
+// GOT patching — data pages only, no code-signing issues) and forces specific
+// iOS @available(...) checks to report "not available", so the caller takes
+// its pre-that-version fallback path.
+//
+// Fortnite has (had) a Swift @available(iOS 17.4, *) check that, on macOS via
+// the iOS-on-Mac runtime, reaches a code path with a NULL async continuation
+// and SIGSEGVs on launch.  Forcing the 17.4 check "false" routes around it.
+//
+// Design constraints:
+//   * The block list is kept EXACT and MINIMAL — one precise version per
+//     known crash.  A range / ">=" match would also perturb unrelated
+//     @available checks (and system frameworks sharing this process), so we
+//     never broaden it speculatively.
+//   * Only the iOS platform (2) is matched: this binary runs as an iOS app on
+//     the iOS-on-Mac runtime, so every relevant check carries platform 2.
+//   * Scope is the launch crash ONLY — MarketplaceKitWrapper / sideload
+//     behaviour is intentionally not touched here.
 
 typedef struct {
     uint32_t platform;
-    uint32_t version;       /* major<<16 | minor<<8 | patch */
+    uint32_t version;       /* (major << 16) | (minor << 8) | patch */
 } dyld_build_version_t;
 
 #define PLATFORM_IOS       2
 #define PACK_VER(M,m,p)    (((uint32_t)(M)<<16)|((uint32_t)(m)<<8)|(uint32_t)(p))
-#define BLOCKED_VERSION    PACK_VER(17, 4, 0)
+
+// Build with -DFN_CRASHFIX_VERBOSE=1 to log each neutralised check (debug only).
+#ifndef FN_CRASHFIX_VERBOSE
+#define FN_CRASHFIX_VERBOSE 0
+#endif
+
+// Exact iOS @available versions forced to "unavailable", each with its reason.
+// To cover a future crash, add one precise entry — do not widen the match.
+static const struct {
+    uint32_t    version;
+    const char *reason;
+} kBlockedIOSVersions[] = {
+    { PACK_VER(17, 4, 0), "iOS 17.4 @available -> NULL async continuation SIGSEGV on launch" },
+};
 
 static bool (*orig_availability_version_check)(uint32_t, dyld_build_version_t []);
 
 static bool hooked_availability_version_check(uint32_t count,
                                                dyld_build_version_t versions[]) {
-    for (uint32_t i = 0; i < count; i++) {
-        if (versions[i].platform == PLATFORM_IOS &&
-            versions[i].version  == BLOCKED_VERSION) {
-            return false;
+    // Defensive: a malformed (NULL) argument array must never fault the hook.
+    if (versions != NULL) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (versions[i].platform != PLATFORM_IOS) {
+                continue;
+            }
+            for (size_t j = 0;
+                 j < sizeof(kBlockedIOSVersions) / sizeof(kBlockedIOSVersions[0]); j++) {
+                if (versions[i].version == kBlockedIOSVersions[j].version) {
+#if FN_CRASHFIX_VERBOSE
+                    NSLog(@"[FnMacTweak] crash-fix: @available(iOS %u.%u.%u) -> false  (%s)",
+                          (versions[i].version >> 16) & 0xFF,
+                          (versions[i].version >>  8) & 0xFF,
+                          (versions[i].version      ) & 0xFF,
+                          kBlockedIOSVersions[j].reason);
+#endif
+                    return false;
+                }
+            }
         }
     }
-    return orig_availability_version_check(count, versions);
+    // Not a targeted version — defer to the genuine check.  If fishhook never
+    // captured the original (cannot happen once rebind_symbols succeeds), fail
+    // safe by reporting "available" — i.e. unchanged OS behaviour.
+    return orig_availability_version_check ? orig_availability_version_check(count, versions)
+                                           : true;
 }
+
+// --------- isiOSAppOnMac OVERRIDE ---------
+// Fortnite checks -[NSProcessInfo isiOSAppOnMac]; when YES it takes a
+// Mac-specific path that misbehaves under the iOS-on-Mac runtime.  Returning
+// NO makes Fortnite behave as on a real iOS device.  This replaces the old
+// static __objc_methname "isiOSAppOnMac" -> "isProxy" rename.
+%hook NSProcessInfo
+- (BOOL)isiOSAppOnMac {
+    return NO;
+}
+%end
 
 // --------- DEVICE SPOOFING ---------
 // Intercepts sysctl/sysctlbyname to report DEVICE_MODEL and OEM_ID,
@@ -883,7 +939,7 @@ static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
     // Initialize Gyro-Mouse Proxy hooks
     ue_init_gyro_hooks();
 
-    // Fishhook for device spoofing + macOS 26.4 crash fix
+    // Fishhook: device spoofing + availability hook (iOS 17.4 crash fix)
     struct rebinding rebindings[] = {
         {"sysctl", (void *)pt_sysctl, (void **)&orig_sysctl},
         {"sysctlbyname", (void *)pt_sysctlbyname, (void **)&orig_sysctlbyname},

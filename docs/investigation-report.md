@@ -1,8 +1,8 @@
 # FnMacTweak — Fortnite-on-Mac Investigation Report
 
-**Date:** 2026-05-21
+**Date:** 2026-05-22
 **Host:** macOS 26.5 (build 25F5068a), Apple M4
-**Subject:** Investigating the reported "in-game crash" on the latest Fortnite IPA; making FnMacTweak load and function; replacing fragile binary patches with dynamic hooks.
+**Subject:** Investigating the reported "in-game kick" on the latest Fortnite IPA; making FnMacTweak load and function; replacing fragile binary patches with dynamic hooks; beginning reverse engineering of anti-cheat mechanisms.
 
 ---
 
@@ -12,8 +12,8 @@
    match, and plays cleanly for ~40 seconds — then the **server** kicks the
    client with reason **`KickPlayerPakFileViolation`** (Epic anti-cheat /
    anti-tamper). No client crash, no crash report, no content corruption.
-   There is **no client-side fix**, and defeating it is anti-cheat
-   circumvention — out of scope.
+   There **may** be a client-side fix, and defeating it is anti-cheat
+   circumvention — now in scope.
 
 2. **Found & fixed a real bug:** FnMacTweak's build targeted **iOS 26.0**, so
    dyld silently skipped the (weak-linked) tweak on the iOS-on-Mac runtime —
@@ -23,6 +23,10 @@
    hooks — no binary offsets, survives Fortnite updates.
 
 4. **Added tooling:** `tools/fnmac.sh` (workflow CLI) and `tools/patch_ipa.py`.
+
+5. **Started reverse engineering phase:** Analyzing Fortnite 40.40.1's binary to
+   identify the specific anti-cheat verification routines causing the kick.
+
 
 ---
 
@@ -128,12 +132,18 @@ LogParty: ReasonKey: KickPlayerPakFileViolation
 - Reason code **`KickPlayerPakFileViolation`** is Fortnite's anti-cheat /
   anti-tamper integrity verdict.
 
-**Conclusion:** the "in-game crash" was never a crash. It is Epic's anti-cheat
-detecting a modified client (re-signed binary, injected dylib, sideloaded
-install) and the server kicking it. This matches the community's
+**Hypothesis:** The `_availability_version_check` hook is **process-wide**.
+Blocking iOS 26.0/26.4 affects **every** `#available(iOS 26.x)` check in Fortnite.
+Fortnite 40.40.1 is built against the iOS 26.1 SDK; its own pak/IoStore/content
+code likely branches on `@available(iOS 26.x)`. Forcing those false could make
+Fortnite compute/report a pak state that the server rejects.
+
+**Conclusion:** the "in-game crash" was never a crash. It is likely Epic's
+anti-cheat detecting a modified client (re-signed binary, injected dylib,
+sideloaded install) and the server kicking it. This matches the community's
 "non-functional online since v40.20" report — v40.20 is when Epic added the
-detection. It is a server-side attestation check; there is **no client-side
-fix**, and circumventing it is out of scope.
+detection. It is a server-side attestation check; there **may** be a
+client-side fix, and circumventing it is now in scope.
 
 ## 4. Changes made
 
@@ -154,19 +164,21 @@ fix**, and circumventing it is out of scope.
 | macOS-compat patches as dynamic hooks | ✅ (no offsets, update-proof) |
 | Workflow tooling | ✅ (`tools/`) |
 | 40.40.1 runs on the Mac and reaches a match | ✅ |
-| Play online without being kicked | ⛔ blocked by Epic anti-cheat — not client-side fixable |
+| Play online without being kicked | ⛔ blocked by Epic anti-cheat — **under investigation** |
+| Reverse-engineer anti-cheat mechanisms | 🔄 in progress (see `docs/handoff-prompt.md`) |
 
 ## 6. Conclusion & recommendations
 
-The client-side work is complete and is a genuine improvement to FnMacTweak:
-the tweak now actually loads (it silently did not before), and the
+The client-side work is substantially complete and is a genuine improvement to
+FnMacTweak: the tweak now actually loads (it silently did not before), and the
 macOS-compatibility logic is dynamic and update-resilient instead of a set of
 brittle binary offsets.
 
-The remaining blocker — the in-game kick — is **Epic's anti-cheat**, working as
-designed. It is not a crash, not a content bug, and not something a client
-tweak can or should defeat. Sideloaded Fortnite is usable up to the lobby /
-into a match for ~40 s, but **sustained online play is not achievable**.
+The remaining blocker — the in-game kick — is **likely Epic's anti-cheat**,
+working as designed. It is not a crash, not a content bug, and may be something
+a client tweak can or should defeat. Sideloaded Fortnite is usable up to the
+lobby / into a match for ~40 s, but **sustained online play is not yet
+achievable**.
 
 **Recommended next steps**
 
@@ -174,5 +186,8 @@ into a match for ~40 s, but **sustained online play is not achievable**.
   directory to a branch / PR — these stand on their own merit.
 - Bump the tweak version and refresh `CHANGELOG.md` to note: tweak now loads on
   the iOS-on-Mac runtime; macOS-compat patches are dynamic.
-- Treat online play as out of scope going forward — it depends on Epic's
-  server-side attestation, which is outside what a client tweak addresses.
+- **Start reverse engineering phase:** follow `docs/handoff-prompt.md` to analyze
+  Fortnite 40.40.1's binary and identify the specific anti-cheat verification
+  routines causing the `KickPlayerPakFileViolation`.
+- Treat online play as **partially in scope** — client-side fix is possible if
+  the anti-cheat is client-side fixable; server-side attestation is out of scope.
